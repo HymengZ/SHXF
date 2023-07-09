@@ -1,0 +1,96 @@
+image: docker:stable
+
+variables:
+  GIT_SSL_NO_VERIFY: "true"
+  # 测试仓库镜像地址
+  QCE_DEV_CONTAINER_URL: $NEXUS_REGISTRY_ADDRESS/fte_fire_manage:${CI_COMMIT_REF_SLUG}
+  # 生产仓库镜像地址
+  QCE_PRO_CONTAINER_URL: $NEXUS_REGISTRY_ADDRESS/fte_fire_manage:${CI_COMMIT_SHORT_SHA}
+  PROJECT_DOCKER_NAME: "fte_fire_manage"
+  SWARM_SERVICE_NAME: "fte_fire_manage"
+  K8S_PRO_DEPLOYNAME: "cwit_fte_fire_manage"
+
+stages:
+  - pack
+  - build
+  - deploy
+
+job-pack:
+  stage: pack
+  image: node:13.8-alpine
+  cache:
+    key: ${CI_COMMIT_REF_SLUG}
+    paths:
+      - node_modules/
+  variables:
+    YARN_BUILD: "yarn build"
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "release"'
+      variables:
+        YARN_BUILD: "yarn build"
+    - if: '$CI_COMMIT_BRANCH == "master"'
+  tags:
+    - cwit
+  script:
+    - yarn config set registry https://registry.npmmirror.com/
+    - yarn install --no-progress
+    - $YARN_BUILD
+  artifacts:
+    expire_in: 1 week
+    paths:
+      - dist
+
+job-build-dev:
+  stage: build
+  only:
+    - release
+  tags:
+    - cwit
+  before_script:
+    - docker login $NEXUS_REGISTRY_ADDRESS --username $REGISTRY_USERNAME --password $REGISTRY_PASSWORD
+  dependencies:
+    - job-pack
+  script:
+    - docker build -t $QCE_DEV_CONTAINER_URL .
+    - docker push $QCE_DEV_CONTAINER_URL
+
+job-build-pro:
+  stage: build
+  only:
+    - master
+  tags:
+    - master
+  before_script:
+    - docker login $QCE_REGISTRY_ADDRESS --username $QCE_REGISTRY_USERNAME --password $QCE_REGISTRY_PASSWORD
+  dependencies:
+    - job-pack
+  script:
+    - docker build -t $QCE_PRO_CONTAINER_URL .
+    - docker push $QCE_PRO_CONTAINER_URL
+
+job-deploy-dev:
+  stage: deploy
+  image: $NEXUS_REGISTRY_ADDRESS/debian-ssh:latest
+  only:
+    - release
+  tags:
+    - cwit
+  before_script:
+    - eval $(ssh-agent -s)
+    - '[[ -f /.dockerenv ]] && echo -e "Host *\n\tStrictHostKeyChecking no\n\n" > ~/.ssh/config'
+  script:
+    - ssh-add <(echo "$RUNNER_SSH_PRIVATE_KEY")
+    - echo $QCE_DEV_CONTAINER_URL
+    - ssh -o StrictHostKeyChecking=no root@"$SWARM_MANAGE_SERVER_TEST_IP" docker pull $QCE_DEV_CONTAINER_URL
+    - ssh -o StrictHostKeyChecking=no root@"$SWARM_MANAGE_SERVER_TEST_IP" docker service update --with-registry-auth --image $QCE_DEV_CONTAINER_URL $SWARM_SERVICE_NAME
+
+job-deploy-pro:
+  stage: deploy
+  image: qce-reg.stcsm.sh.gov.cn/library/kubectl:latest
+  only:
+    - master
+  tags:
+    - master
+  script:
+    - echo $QCE_PRO_CONTAINER_URL
+    - kubectl -n kewei set image deploy $K8S_PRO_DEPLOYNAME main=$QCE_PRO_CONTAINER_URL
